@@ -1,10 +1,12 @@
 {
   "name": "@pineauto/piece-pineauto",
-  "version": "0.0.1",
+  "version": "0.0.16",
   "type": "commonjs",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
   "dependencies": {
-    "tslib": "^2.3.0"
+    "tslib": "^2.3.0",
+    "@noble/ed25519": "3.0.0",
+    "bs58": "6.0.0"
   }
 }

@@ -16,11 +16,25 @@ export default defineConfig(({ command, mode }) => {
     ? 'https://activepieces.com/favicon.ico'
     : '${AP_FAVICON_URL}';
 
+  const hmrHost = process.env.VITE_HMR_HOST ?? process.env.HMR_HOST;
+  const hmrProtocol =
+    process.env.VITE_HMR_PROTOCOL ?? process.env.HMR_PROTOCOL ?? 'wss';
+  const hmrClientPort =
+    process.env.VITE_HMR_CLIENT_PORT ?? process.env.HMR_CLIENT_PORT;
+  const hmrConfig = hmrHost
+    ? {
+        host: hmrHost,
+        protocol: hmrProtocol,
+        ...(hmrClientPort ? { clientPort: Number(hmrClientPort) } : {}),
+      }
+    : undefined;
+
   return {
     root: __dirname,
     cacheDir: '../../node_modules/.vite/packages/react-ui',
 
     server: {
+      allowedHosts: true,
       proxy: {
         '/api': {
           target: 'http://127.0.0.1:3000',
@@ -35,6 +49,7 @@ export default defineConfig(({ command, mode }) => {
       },
       port: 4200,
       host: '0.0.0.0',
+      hmr: hmrConfig,
     },
 
     preview: {

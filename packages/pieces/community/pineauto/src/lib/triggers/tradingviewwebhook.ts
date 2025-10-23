@@ -1,5 +1,9 @@
 import { createTrigger, TriggerStrategy, Property } from '@activepieces/pieces-framework';
 import { MarkdownVariant } from '@activepieces/shared';
+import { enqueueTradingViewEvent } from '../common/tradingview-event.service';
+import { TradingViewOrderEvent } from '../common/tradingview.types';
+
+export type { TradingViewOrderEvent };
 
 interface TradingViewWebhookPayload {
   secret?: string;
@@ -8,17 +12,6 @@ interface TradingViewWebhookPayload {
   qty?: unknown;
   client_order_id?: string;
   [key: string]: unknown;
-}
-
-export interface TradingViewOrderEvent {
-  symbol: string;
-  leverage: number;
-  side: 'buy' | 'sell';
-  qtyMode: 'percent' | 'fixed';
-  qty: number;
-  clientOrderId?: string;
-  rawPayload: unknown;
-  emittedAt: number;
 }
 
 interface TriggerProps {
@@ -156,6 +149,8 @@ export const tradingviewwebhook = createTrigger({
       rawPayload: payload.body,
       emittedAt: Date.now(),
     };
+
+    await enqueueTradingViewEvent(context, event);
 
     return [event];
   },

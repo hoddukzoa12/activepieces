@@ -1,40 +1,30 @@
 import { createAction, Property } from '@activepieces/pieces-framework';
-import bs58 from 'bs58';
-import { signAndSendRequest } from '../common/signer';
-import { PineautoAuthType } from '../../index';
+import { PineautoAuthType } from '../common/orderly-auth';
+import {
+  applyQuantityStep,
+  determineFlexibleQuantityStep,
+  normalizeNumber,
+  parseQuoteAsset,
+  resolveOrderSizing,
+} from '../common/order-sizing.service';
+import {
+  consumeQueuedTradingViewEvent,
+  ensureTradingViewOrderEvent,
+  selectClientOrderId,
+} from '../common/tradingview-event.service';
+import { OrderlyHttpClient, buildOrderlyUrl, createOrderlyClientFromAuth } from '../common/orderly-http';
+import { TradingViewOrderEvent } from '../common/tradingview.types';
+import { OrderlyEnvironment } from '../common/orderly-config';
 
-interface TradingViewOrderEvent {
-  symbol: string;
-  leverage?: number;
-  side: 'buy' | 'sell';
-  qtyMode: 'percent' | 'fixed';
-  qty: number;
-  clientOrderId?: string;
-  rawPayload?: unknown;
-  emittedAt?: number;
-}
-
-interface OrderSizingResult {
-  quantity: number;
-  referencePrice?: number;
-  availableBalance?: number;
-  quoteAsset?: string | null;
-  notional?: number;
-  fallbackQuantity?: number;
-  leverageApplied: number;
-}
-
-type OrderResponsePayload = {
+interface OrderResponsePayload {
   data?: Record<string, unknown>;
   [key: string]: unknown;
-};
-
-interface AccountInfoResponse {
-  data?: Record<string, unknown>;
 }
 
-interface AccountBalancesResponse {
-  data?: Record<string, unknown>;
+interface CreateOrderProps {
+  reduce_only?: boolean;
+  client_order_id?: string;
+  order_event_override?: unknown;
 }
 
 export const createOrder = createAction({
@@ -42,11 +32,6 @@ export const createOrder = createAction({
   displayName: 'Create Order',
   description: 'Create a MARKET order on Orderly Network based on a TradingView webhook event.',
   props: {
-    order_event: Property.Json({
-      displayName: 'Order Event',
-      description: 'Pass the JSON emitted by the TradingView trigger (예: {{steps.trigger}}).',
-      required: true,
-    }),
     reduce_only: Property.Checkbox({
       displayName: 'Reduce Only',
       description: 'Only reduce existing exposure. Enable when exiting positions.',
@@ -59,6 +44,11 @@ export const createOrder = createAction({
       required: false,
       defaultValue: '',
     }),
+    order_event_override: Property.Json({
+      displayName: 'Order Event Override (optional)',
+      description: 'Use only when testing without the TradingView trigger.',
+      required: false,
+    }),
   },
 
   async run(context) {
@@ -66,32 +56,39 @@ export const createOrder = createAction({
       throw new Error('Authentication is required. Please connect your Orderly account.');
     }
 
+    const logger = (context as unknown as { logger?: Console }).logger ?? console;
+    const props = context.propsValue as CreateOrderProps;
     const auth = context.auth as PineautoAuthType;
-    const baseUrl = auth.environment === 'mainnet'
-      ? 'https://api.orderly.org'
-      : 'https://testnet-api.orderly.org';
+    const environment = auth.environment ?? OrderlyEnvironment.TESTNET;
 
-    const props = context.propsValue as {
-      order_event: unknown;
-      reduce_only?: boolean;
-      client_order_id?: string;
-    };
+    const client = await createOrderlyClientFromAuth({
+      accountId: auth.account_id,
+      environment,
+      secretKey: auth.secret_key,
+    });
 
-    const event = ensureOrderEvent(props.order_event);
+    const overrideEvent =
+      props.order_event_override && Object.keys(props.order_event_override as Record<string, unknown>).length > 0
+        ? ensureTradingViewOrderEvent(props.order_event_override)
+        : null;
 
-    const privateKey = bs58.decode(auth.secret_key);
+    const event = overrideEvent ?? (await consumeQueuedTradingViewEvent(context));
+
+    if (!event) {
+      throw new Error(
+        'No TradingView event found. Please trigger this action from the TradingView webhook or provide an override payload.',
+      );
+    }
     const quoteAsset = parseQuoteAsset(event.symbol);
 
     const sizing = await resolveOrderSizing({
+      environment,
+      client,
       event,
-      auth,
-      baseUrl,
-      privateKey,
       quoteAsset,
     });
 
-    const orderQuantity = sizing.quantity;
-    if (!Number.isFinite(orderQuantity) || orderQuantity <= 0) {
+    if (!Number.isFinite(sizing.quantity) || sizing.quantity <= 0) {
       throw new Error('Calculated order quantity is invalid. Check trigger sizing settings.');
     }
 
@@ -113,106 +110,38 @@ export const createOrder = createAction({
       baseOrderData['client_order_id'] = clientOrderId;
     }
 
-    const sendOrder = async (
-      quantityToUse: number,
-    ): Promise<{
-      response: Response;
-      result: OrderResponsePayload;
-      normalizedQty: number;
-    }> => {
-      const normalizedQty = normalizeNumber(quantityToUse, 6);
-      const payload: Record<string, unknown> = {
-        ...baseOrderData,
-        order_quantity: normalizedQty,
-        quantity: normalizedQty,
-      };
-
-      console.log('📤 Sending market order:', {
-        ...payload,
-        environment: auth.environment,
-        account: `${auth.account_id.substring(0, 8)}...`,
-      });
-
-      const response = await signAndSendRequest(
-        auth.account_id,
-        privateKey,
-        `${baseUrl}/v1/order`,
-        {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        },
-      );
-
-      const result = await response.json() as OrderResponsePayload;
-
-      return { response, result, normalizedQty };
-    };
-
     const retryStep = determineFlexibleQuantityStep(undefined) || 0.001;
-    let attemptQuantity = orderQuantity;
+    let attemptQuantity = sizing.quantity;
     let usedFallbackQuantity = !sizing.fallbackQuantity;
 
     for (let attempt = 0; attempt < 6; attempt++) {
       try {
-        const { response, result, normalizedQty } = await sendOrder(attemptQuantity);
+        const { response, result, normalizedQty } = await sendOrder({
+          client,
+          environment,
+          baseOrderData,
+          quantityToUse: attemptQuantity,
+          logger,
+          auth,
+          event,
+        });
 
         if (!response.ok) {
-          const messageText = typeof result['message'] === 'string'
-            ? result['message'] as string
-            : undefined;
-          const errorText = typeof result['error'] === 'string'
-            ? result['error'] as string
-            : undefined;
-          const errorMessage = messageText
-            || errorText
-            || `Order creation failed with status ${response.status}`;
-
-          if (response.status === 400) {
-            if (errorMessage.toLowerCase().includes('insufficient')) {
-              const reducedQuantity = applyQuantityStep(attemptQuantity * 0.8, retryStep);
-              if (reducedQuantity <= 0 || Math.abs(reducedQuantity - attemptQuantity) < 1e-8) {
-                throw new Error('❌ Insufficient balance for this order. Please check available collateral.');
-              }
-              console.warn('[pineauto] Reducing quantity due to insufficient balance.', {
-                previousQuantity: attemptQuantity,
-                reducedQuantity,
-              });
-              attemptQuantity = reducedQuantity;
-              continue;
-            }
-            if (errorMessage.toLowerCase().includes('quantity')) {
-              throw new Error(`❌ Invalid quantity detected. Computed value: ${attemptQuantity}`);
-            }
-            if (
-              errorMessage.includes('filter requirement')
-              && sizing.fallbackQuantity
-              && !usedFallbackQuantity
-              && Math.abs(sizing.fallbackQuantity - orderQuantity) > 1e-8
-            ) {
-              console.warn('[pineauto] Retrying order with fallback quantity due to filter requirement.', {
-                originalQuantity: orderQuantity,
-                fallbackQuantity: sizing.fallbackQuantity,
-              });
-              attemptQuantity = sizing.fallbackQuantity;
-              usedFallbackQuantity = true;
-              continue;
-            }
-            throw new Error(`❌ Invalid order parameters: ${errorMessage}`);
+          const handled = handleNonOkResponse({
+            response,
+            result,
+            attemptQuantity,
+            retryStep,
+            sizing,
+            orderQuantity: sizing.quantity,
+            usedFallbackQuantity,
+          });
+          if (handled.type === 'retry') {
+            attemptQuantity = handled.nextQuantity;
+            usedFallbackQuantity = handled.usedFallbackQuantity;
+            continue;
           }
-          if (response.status === 401) {
-            throw new Error('🔐 Authentication failed. Please verify your Orderly credentials.');
-          }
-          if (response.status === 403) {
-            throw new Error('🚫 Account lacks permission or is not activated. Check Orderly account status.');
-          }
-          if (response.status === 429) {
-            throw new Error('⏱️ Rate limit exceeded. Please wait and try again.');
-          }
-          if (response.status === 503) {
-            throw new Error('🔧 Orderly service unavailable. Retry later.');
-          }
-
-          throw new Error(errorMessage);
+          throw handled.error;
         }
 
         const orderData = (result['data'] ?? {}) as Record<string, unknown>;
@@ -222,14 +151,17 @@ export const createOrder = createAction({
         const orderSymbol = (orderData['symbol'] ?? result['symbol'] ?? event.symbol) as string;
         const orderSide = (orderData['side'] ?? result['side'] ?? side) as string;
         const orderType = (orderData['order_type'] ?? result['order_type'] ?? 'MARKET') as string;
-        const resolvedQuantity = orderData['order_quantity'] ?? orderData['quantity'] ?? result['order_quantity'] ?? result['quantity'] ?? normalizedQty;
-        const avgPrice = orderData['avg_executed_price'] ?? result['avg_executed_price'] ?? sizing.referencePrice ?? null;
+        const resolvedQuantity =
+          orderData['order_quantity'] ??
+          orderData['quantity'] ??
+          result['order_quantity'] ??
+          result['quantity'] ??
+          normalizedQty;
+        const avgPrice =
+          orderData['avg_executed_price'] ?? result['avg_executed_price'] ?? sizing.referencePrice ?? null;
         const createdTime = (orderData['created_time'] ?? result['created_time']) as string | undefined;
 
-        console.log('✅ Order created successfully:', {
-          order_id: orderId,
-          status: orderStatus,
-        });
+        logger.info?.('[pineauto] Order created successfully.', { orderId, status: orderStatus });
 
         return {
           success: true,
@@ -250,7 +182,7 @@ export const createOrder = createAction({
           raw_response: orderData,
           trigger_event: event,
         };
-      } catch (error: unknown) {
+      } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const lowerMessage = message.toLowerCase();
 
@@ -270,7 +202,7 @@ export const createOrder = createAction({
         if (reducedQuantity <= 0 || Math.abs(reducedQuantity - attemptQuantity) < 1e-8) {
           throw new Error('❌ Insufficient balance for this order. Please check available collateral.');
         }
-        console.warn('[pineauto] Reducing quantity due to insufficient balance.', {
+        logger.warn?.('[pineauto] Reducing quantity due to insufficient balance (catch block).', {
           previousQuantity: attemptQuantity,
           reducedQuantity,
         });
@@ -282,619 +214,110 @@ export const createOrder = createAction({
   },
 });
 
-function ensureOrderEvent(value: unknown): TradingViewOrderEvent {
-  if (!value || typeof value !== 'object') {
-    throw new Error('Order event must be a JSON object.');
-  }
-
-  const event = value as Record<string, unknown>;
-
-  const symbolValue = event['symbol'];
-  const symbol = typeof symbolValue === 'string' && symbolValue.trim().length > 0
-    ? symbolValue.trim()
-    : null;
-  if (!symbol) {
-    throw new Error('Order event must include a symbol.');
-  }
-
-  const rawSideValue = event['side'];
-  const rawSide = typeof rawSideValue === 'string' ? rawSideValue.toLowerCase() : '';
-  if (rawSide !== 'buy' && rawSide !== 'sell') {
-    throw new Error('Order event side must be "buy" or "sell".');
-  }
-
-  const rawQtyModeValue = event['qtyMode'] ?? event['qty_mode'];
-  const rawQtyMode = typeof rawQtyModeValue === 'string' ? rawQtyModeValue.toLowerCase() : '';
-  if (rawQtyMode !== 'percent' && rawQtyMode !== 'fixed') {
-    throw new Error('Order event qtyMode must be "percent" or "fixed".');
-  }
-
-  const qty = Number(event['qty']);
-  if (!Number.isFinite(qty) || qty <= 0) {
-    throw new Error('Order event qty must be a positive number.');
-  }
-
-  const leverage = Number(event['leverage']);
-
-  return {
-    symbol,
-    side: rawSide as 'buy' | 'sell',
-    qtyMode: rawQtyMode as 'percent' | 'fixed',
-    qty,
-    leverage: Number.isFinite(leverage) && leverage > 0 ? leverage : 1,
-    clientOrderId: typeof event['clientOrderId'] === 'string'
-      ? (event['clientOrderId'] as string)
-      : undefined,
-    rawPayload: event['rawPayload'],
-    emittedAt: typeof event['emittedAt'] === 'number' ? Number(event['emittedAt']) : undefined,
-  };
-}
-
-function selectClientOrderId(eventId: string | undefined, overrideId?: string): string | undefined {
-  const cleanedOverride = overrideId?.trim();
-  if (cleanedOverride) {
-    if (cleanedOverride.length > 36) {
-      throw new Error('Client order ID must be 36 characters or fewer.');
-    }
-    return cleanedOverride;
-  }
-
-  if (eventId && eventId.trim().length > 0) {
-    const trimmed = eventId.trim();
-    if (trimmed.length > 36) {
-      throw new Error('Client order ID from event exceeds 36 characters.');
-    }
-    return trimmed;
-  }
-
-  return undefined;
-}
-
-interface ResolveOrderSizingParams {
-  event: TradingViewOrderEvent;
+async function sendOrder(params: {
+  client: OrderlyHttpClient;
+  environment: OrderlyEnvironment;
+  baseOrderData: Record<string, unknown>;
+  quantityToUse: number;
+  logger: Console;
   auth: PineautoAuthType;
-  baseUrl: string;
-  privateKey: Uint8Array;
-  quoteAsset: string | null;
-}
+  event: TradingViewOrderEvent;
+}): Promise<{
+  response: Response;
+  result: OrderResponsePayload;
+  normalizedQty: number;
+}> {
+  const { client, environment, baseOrderData, quantityToUse, logger, auth } = params;
+  const normalizedQty = normalizeNumber(quantityToUse, 6);
+  const payload: Record<string, unknown> = {
+    ...baseOrderData,
+    order_quantity: normalizedQty,
+    quantity: normalizedQty,
+  };
 
-async function resolveOrderSizing(params: ResolveOrderSizingParams): Promise<OrderSizingResult> {
-  const {
-    event,
-    auth,
-    baseUrl,
-    privateKey,
-    quoteAsset,
-  } = params;
-
-  const leverageApplied = Math.max(1, Number(event.leverage) || 1);
-
-  if (event.qtyMode === 'fixed') {
-    const adjustedQty = applyQuantityStep(event.qty, determineFlexibleQuantityStep(event.qty));
-    const fallbackQuantity = applyQuantityStep(event.qty, determineStrictQuantityStep(event.qty) ?? event.qty);
-    const notional = adjustedQty * leverageApplied;
-
-    return {
-      quantity: adjustedQty,
-      referencePrice: undefined,
-      quoteAsset: quoteAsset ?? parseQuoteAsset(event.symbol),
-      fallbackQuantity,
-      leverageApplied,
-      notional,
-    };
-  }
-
-  const percent = event.qty;
-
-  const referencePrice = await fetchReferencePrice({
-    baseUrl,
-    symbol: event.symbol,
+  logger.debug?.('[pineauto] Sending market order.', {
+    payloadPreview: { ...payload, account: `${auth.account_id.substring(0, 8)}...` },
   });
 
-  const accountInfo = await fetchAccountInfo(baseUrl, auth, privateKey);
-  let availableBalance = extractAvailableBalance(accountInfo, quoteAsset ?? parseQuoteAsset(event.symbol));
-  console.log('[pineauto] account info raw', accountInfo);
-  console.log('[pineauto] extracted balance from account info', availableBalance);
+  const response = await client.post(buildOrderlyUrl(environment, '/v1/order'), {
+    body: JSON.stringify(payload),
+  });
 
-  if (availableBalance == null) {
-    const balances = await fetchAccountBalances(baseUrl, auth, privateKey);
-    availableBalance = extractAvailableBalanceFromBalances(balances, quoteAsset ?? parseQuoteAsset(event.symbol));
-    console.log('[pineauto] account balances raw', balances);
-    console.log('[pineauto] extracted balance from account balances', availableBalance);
+  let result: OrderResponsePayload = {};
+  try {
+    result = (await response.json()) as OrderResponsePayload;
+  } catch {
+    result = {};
   }
 
-  if (availableBalance == null) {
-    const holdings = await fetchClientHolding(baseUrl, auth, privateKey);
-    availableBalance = extractBalanceFromHoldings(holdings, quoteAsset ?? parseQuoteAsset(event.symbol));
-    console.log('[pineauto] client holding raw', holdings);
-    console.log('[pineauto] extracted balance from holdings', availableBalance);
-  }
-
-  if (availableBalance == null || availableBalance <= 0) {
-    throw new Error('Unable to determine available collateral from account info or balance endpoints.');
-  }
-
-  const notional = availableBalance * (percent / 100) * leverageApplied;
-  if (!Number.isFinite(notional) || notional <= 0) {
-    throw new Error('Calculated notional value is invalid. Check balance percent and leverage settings.');
-  }
-
-  const rawQuantity = notional / referencePrice;
-  const flexibleStep = determineFlexibleQuantityStep(undefined);
-  const strictStep = determineStrictQuantityStep(undefined);
-  const quantity = applyQuantityStep(rawQuantity, flexibleStep);
-  const fallbackQuantity = strictStep ? applyQuantityStep(rawQuantity, strictStep) : undefined;
-
-  return {
-    quantity,
-    referencePrice,
-    availableBalance,
-    quoteAsset: quoteAsset ?? parseQuoteAsset(event.symbol),
-    notional,
-    fallbackQuantity,
-    leverageApplied,
-  };
+  return { response, result, normalizedQty };
 }
 
-async function fetchAccountBalances(
-  baseUrl: string,
-  auth: PineautoAuthType,
-  privateKey: Uint8Array,
-): Promise<AccountBalancesResponse | null> {
-  try {
-    const response = await signAndSendRequest(
-      auth.account_id,
-      privateKey,
-      `${baseUrl}/v1/client/balance`,
-      { method: 'GET' },
-    );
+function handleNonOkResponse(params: {
+  response: Response;
+  result: OrderResponsePayload;
+  attemptQuantity: number;
+  retryStep: number;
+  sizing: Awaited<ReturnType<typeof resolveOrderSizing>>;
+  orderQuantity: number;
+  usedFallbackQuantity: boolean;
+}):
+  | { type: 'retry'; nextQuantity: number; usedFallbackQuantity: boolean }
+  | { type: 'error'; error: Error } {
+  const { response, result, attemptQuantity, retryStep, sizing, orderQuantity, usedFallbackQuantity } = params;
+  const messageText = typeof result['message'] === 'string' ? (result['message'] as string) : undefined;
+  const errorText = typeof result['error'] === 'string' ? (result['error'] as string) : undefined;
+  const errorMessage = messageText || errorText || `Order creation failed with status ${response.status}`;
+  const lowerError = errorMessage.toLowerCase();
 
-    if (!response.ok) {
-      const errorBody = await response.text();
-      console.warn('[pineauto] account balance request failed', {
-        status: response.status,
-        statusText: response.statusText,
-        body: errorBody,
+  if (response.status === 400) {
+    if (lowerError.includes('insufficient')) {
+      const reducedQuantity = applyQuantityStep(attemptQuantity * 0.8, retryStep);
+      if (reducedQuantity <= 0 || Math.abs(reducedQuantity - attemptQuantity) < 1e-8) {
+        return {
+          type: 'error',
+          error: new Error('❌ Insufficient balance for this order. Please check available collateral.'),
+        };
+      }
+      console.warn('[pineauto] Reducing quantity due to insufficient balance (HTTP 400).', {
+        previousQuantity: attemptQuantity,
+        reducedQuantity,
       });
-      return null;
+      return { type: 'retry', nextQuantity: reducedQuantity, usedFallbackQuantity };
     }
 
-    return await response.json();
-  } catch (error) {
-    console.warn('[pineauto] Failed to fetch account balances:', error);
-    return null;
-  }
-}
+    if (lowerError.includes('quantity')) {
+      return { type: 'error', error: new Error(`❌ Invalid quantity detected. Computed value: ${attemptQuantity}`) };
+    }
 
-async function fetchAccountInfo(
-  baseUrl: string,
-  auth: PineautoAuthType,
-  privateKey: Uint8Array,
-): Promise<AccountInfoResponse | null> {
-  try {
-    const response = await signAndSendRequest(
-      auth.account_id,
-      privateKey,
-      `${baseUrl}/v1/client/info`,
-      { method: 'GET' },
-    );
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      console.warn('[pineauto] account info request failed', {
-        status: response.status,
-        statusText: response.statusText,
-        body: errorBody,
+    if (
+      errorMessage.includes('filter requirement') &&
+      sizing.fallbackQuantity &&
+      !usedFallbackQuantity &&
+      Math.abs(sizing.fallbackQuantity - orderQuantity) > 1e-8
+    ) {
+      console.warn('[pineauto] Retrying order with fallback quantity due to filter requirement.', {
+        originalQuantity: orderQuantity,
+        fallbackQuantity: sizing.fallbackQuantity,
       });
-      return null;
+      return { type: 'retry', nextQuantity: sizing.fallbackQuantity, usedFallbackQuantity: true };
     }
 
-    return await response.json();
-  } catch (error) {
-    console.warn('[pineauto] Failed to fetch account info:', error);
-    return null;
-  }
-}
-
-async function fetchClientHolding(
-  baseUrl: string,
-  auth: PineautoAuthType,
-  privateKey: Uint8Array,
-): Promise<AccountBalancesResponse | null> {
-  try {
-    const response = await signAndSendRequest(
-      auth.account_id,
-      privateKey,
-      `${baseUrl}/v1/client/holding`,
-      { method: 'GET' },
-    );
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      console.warn('[pineauto] client holding request failed', {
-        status: response.status,
-        statusText: response.statusText,
-        body: errorBody,
-      });
-      return null;
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.warn('[pineauto] Failed to fetch client holding:', error);
-    return null;
-  }
-}
-
-function extractAvailableBalance(
-  info: AccountInfoResponse | null,
-  quoteAsset?: string | null,
-): number | null {
-  if (!info || !info.data) {
-    return null;
+    return { type: 'error', error: new Error(`❌ Invalid order parameters: ${errorMessage}`) };
   }
 
-  const directKeys = [
-    'total_available_balance',
-    'available_balance',
-    'available',
-    'free_collateral',
-    'available_withdrawal',
-  ];
-
-  for (const key of directKeys) {
-    const value = (info.data as Record<string, unknown>)[key];
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) {
-      return numeric;
-    }
+  if (response.status === 401) {
+    return { type: 'error', error: new Error('🔐 Authentication failed. Please verify your Orderly credentials.') };
+  }
+  if (response.status === 403) {
+    return { type: 'error', error: new Error('🚫 Account lacks permission or is not activated. Check Orderly account status.') };
+  }
+  if (response.status === 429) {
+    return { type: 'error', error: new Error('⏱️ Rate limit exceeded. Please wait and try again.') };
+  }
+  if (response.status === 503) {
+    return { type: 'error', error: new Error('🔧 Orderly service unavailable. Retry later.') };
   }
 
-  const dataRecord = info.data as Record<string, unknown>;
-  const balances = (dataRecord['balances'] as Record<string, unknown> | undefined)
-    || (dataRecord['asset_balances'] as Record<string, unknown> | undefined)
-    || (dataRecord['collaterals'] as Record<string, unknown> | undefined);
-
-  if (balances) {
-    const candidate = pickBalanceRecord(balances, quoteAsset);
-    if (candidate != null) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
-
-function extractAvailableBalanceFromBalances(
-  balancesResponse: AccountBalancesResponse | null,
-  quoteAsset?: string | null,
-): number | null {
-  if (!balancesResponse || !balancesResponse.data) {
-    return null;
-  }
-
-  const balances = balancesResponse.data as Record<string, unknown>;
-  return pickBalanceRecord(balances, quoteAsset);
-}
-
-function extractBalanceFromHoldings(
-  holdingsResponse: AccountBalancesResponse | null,
-  quoteAsset?: string | null,
-): number | null {
-  if (!holdingsResponse || !holdingsResponse.data) {
-    return null;
-  }
-
-  const data = holdingsResponse.data as Record<string, unknown>;
-  const holdingList = Array.isArray(data['holding']) ? data['holding'] as unknown[] : [];
-  for (const entry of holdingList) {
-    if (entry && typeof entry === 'object') {
-      const obj = entry as Record<string, unknown>;
-      const asset = getAssetCode(obj);
-      if (!quoteAsset || normalizeAsset(asset) === normalizeAsset(quoteAsset)) {
-        const numeric = Number(obj['available'] ?? obj['holding'] ?? obj['balance']);
-        if (Number.isFinite(numeric)) {
-          return numeric;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function pickBalanceRecord(
-  balances: Record<string, unknown>,
-  quoteAsset?: string | null,
-): number | null {
-  if (!balances) {
-    return null;
-  }
-
-  if (quoteAsset) {
-    const normalizedAsset = normalizeAsset(quoteAsset);
-    for (const value of Object.values(balances)) {
-      if (value && typeof value === 'object') {
-        const entry = value as Record<string, unknown>;
-        const asset = getAssetCode(entry);
-        if (normalizeAsset(asset) === normalizedAsset) {
-          return extractNumericBalance(entry);
-        }
-      }
-    }
-  }
-
-  for (const value of Object.values(balances)) {
-    if (value && typeof value === 'object') {
-      const numeric = extractNumericBalance(value);
-      if (numeric != null) {
-        return numeric;
-      }
-    }
-  }
-
-  return null;
-}
-
-function extractNumericBalance(entry: unknown): number | null {
-  if (entry && typeof entry === 'object') {
-    const keys = [
-      'available_balance',
-      'available',
-      'free_collateral',
-      'holding',
-      'balance',
-      'equity',
-    ];
-
-    for (const key of keys) {
-      if (key in (entry as Record<string, unknown>)) {
-        const value = (entry as Record<string, unknown>)[key];
-        const numeric = Number(value);
-        if (Number.isFinite(numeric)) {
-          return numeric;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function getAssetCode(entry: unknown): string | null {
-  if (entry && typeof entry === 'object') {
-    const obj = entry as Record<string, unknown>;
-    const fields = ['asset', 'symbol', 'token', 'currency'];
-    for (const field of fields) {
-      const value = obj[field];
-      if (typeof value === 'string') {
-        return value;
-      }
-    }
-  }
-  return null;
-}
-
-function parseQuoteAsset(symbol: string): string | null {
-  if (!symbol || typeof symbol !== 'string') {
-    return null;
-  }
-
-  const parts = symbol.split('_');
-  if (parts.length >= 3) {
-    return parts[parts.length - 1];
-  }
-
-  return null;
-}
-
-function normalizeAsset(asset: string | null | undefined): string {
-  return asset?.toUpperCase?.() ?? '';
-}
-
-function normalizeNumber(value: number, dp: number): number {
-  const factor = 10 ** dp;
-  return Math.round(value * factor) / factor;
-}
-
-function determineFlexibleQuantityStep(referenceQuantity?: number): number {
-  const strictStep = determineStrictQuantityStep(referenceQuantity);
-  if (!strictStep) {
-    return 0.001;
-  }
-
-  if (strictStep >= 1) {
-    return strictStep;
-  }
-
-  return Math.min(strictStep, 0.001);
-}
-
-function determineStrictQuantityStep(referenceQuantity?: number): number | null {
-  if (!referenceQuantity || referenceQuantity === 0) {
-    return null;
-  }
-
-  const qtyString = referenceQuantity.toString();
-  if (qtyString.includes('e')) {
-    return null;
-  }
-
-  const decimals = qtyString.split('.')[1]?.length ?? 0;
-  return decimals > 0 ? Math.pow(10, -decimals) : 1;
-}
-
-function applyQuantityStep(quantity: number, step: number): number {
-  if (!Number.isFinite(quantity) || quantity <= 0) {
-    return quantity;
-  }
-
-  if (!step || step <= 0) {
-    return quantity;
-  }
-
-  const multiplier = Math.floor(quantity / step);
-  const adjusted = multiplier * step;
-
-  const decimals = step >= 1 ? 0 : Math.min(8, Math.abs(Math.log10(step)));
-  if (adjusted > 0) {
-    return Number(adjusted.toFixed(decimals));
-  }
-
-  return Number(step.toFixed(decimals));
-}
-
-async function fetchReferencePrice(params: {
-  baseUrl: string;
-  symbol: string;
-  fallbackPrice?: number;
-}): Promise<number> {
-  const { baseUrl, symbol, fallbackPrice } = params;
-
-  if (Number.isFinite(fallbackPrice) && fallbackPrice && fallbackPrice > 0) {
-    return Number(fallbackPrice);
-  }
-
-  const firstPositiveNumber = (...values: unknown[]): number | null => {
-    for (const value of values) {
-      const numeric = Number(value);
-      if (Number.isFinite(numeric) && numeric > 0) {
-        return numeric;
-      }
-    }
-    return null;
-  };
-
-  try {
-    const futuresUrl = `${baseUrl}/v1/public/futures/${encodeURIComponent(symbol)}`;
-    const futuresResponse = await fetch(futuresUrl);
-    if (futuresResponse.ok) {
-      const futuresBody = await futuresResponse.json() as Record<string, unknown>;
-      const dataField = futuresBody['data'];
-
-      if (Array.isArray(dataField)) {
-        for (const entry of dataField) {
-          const numeric = firstPositiveNumber(
-            (entry as Record<string, unknown>)?.['mark_price'],
-            (entry as Record<string, unknown>)?.['last_price'],
-            (entry as Record<string, unknown>)?.['index_price'],
-            (entry as Record<string, unknown>)?.['24h_close'],
-          );
-          if (numeric) {
-            return numeric;
-          }
-        }
-      }
-
-      if (dataField && typeof dataField === 'object') {
-        const numeric = firstPositiveNumber(
-          (dataField as Record<string, unknown>)['mark_price'],
-          (dataField as Record<string, unknown>)['last_price'],
-          (dataField as Record<string, unknown>)['index_price'],
-          (dataField as Record<string, unknown>)['24h_close'],
-        );
-        if (numeric) {
-          return numeric;
-        }
-      }
-
-      const directFallback = firstPositiveNumber(
-        futuresBody['mark_price'],
-        futuresBody['last_price'],
-      );
-      if (directFallback) {
-        return directFallback;
-      }
-    }
-  } catch (error) {
-    console.warn('[pineauto] Failed to fetch futures ticker price', {
-      symbol,
-      error,
-    });
-  }
-
-  try {
-    const tickerUrl = new URL(`${baseUrl}/v1/public/market_info`);
-    tickerUrl.searchParams.set('symbol', symbol);
-    const tickerResponse = await fetch(tickerUrl.toString());
-    if (tickerResponse.ok) {
-      const tickerBody = await tickerResponse.json() as Record<string, unknown>;
-      const dataField = tickerBody['data'];
-      if (Array.isArray(dataField)) {
-        for (const entry of dataField) {
-          const numeric = firstPositiveNumber(
-            (entry as Record<string, unknown>)?.['mark_price'],
-            (entry as Record<string, unknown>)?.['last_price'],
-            (entry as Record<string, unknown>)?.['index_price'],
-          );
-          if (numeric) {
-            return numeric;
-          }
-        }
-      }
-
-      if (dataField && typeof dataField === 'object') {
-        const numeric = firstPositiveNumber(
-          (dataField as Record<string, unknown>)['mark_price'],
-          (dataField as Record<string, unknown>)['last_price'],
-          (dataField as Record<string, unknown>)['index_price'],
-        );
-        if (numeric) {
-          return numeric;
-        }
-      }
-
-      const directFallback = firstPositiveNumber(
-        tickerBody['mark_price'],
-        tickerBody['last_price'],
-      );
-      if (directFallback) {
-        return directFallback;
-      }
-    }
-  } catch (error) {
-    console.warn('[pineauto] Failed to fetch market ticker price', {
-      symbol,
-      error,
-    });
-  }
-
-  try {
-    const tradesUrl = new URL(`${baseUrl}/v1/public/market_trades`);
-    tradesUrl.searchParams.set('symbol', symbol);
-    tradesUrl.searchParams.set('limit', '1');
-    const response = await fetch(tradesUrl.toString());
-    if (response.ok) {
-      const body = await response.json() as Record<string, unknown>;
-      const dataField = body['data'];
-      const trades: Array<Record<string, unknown>> = [];
-
-      if (Array.isArray(dataField)) {
-        trades.push(...dataField as Array<Record<string, unknown>>);
-      } else if (dataField && typeof dataField === 'object' && Array.isArray((dataField as Record<string, unknown>)['rows'])) {
-        trades.push(...(dataField as Record<string, unknown>)['rows'] as Array<Record<string, unknown>>);
-      } else if (Array.isArray(body)) {
-        trades.push(...(body as Array<Record<string, unknown>>));
-      }
-
-      const firstTrade = trades[0];
-      if (firstTrade) {
-        const numeric = firstPositiveNumber(
-          firstTrade['price'],
-          firstTrade['trade_price'],
-          firstTrade['executed_price'],
-        );
-        if (numeric) {
-          return numeric;
-        }
-      }
-    }
-  } catch (error) {
-    console.warn('[pineauto] Failed to fetch recent trade price', {
-      symbol,
-      error,
-    });
-  }
-
-  throw new Error('Market price could not be determined automatically. Provide price in the trigger payload or ensure recent trades exist.');
+  return { type: 'error', error: new Error(errorMessage) };
 }
