@@ -1,9 +1,38 @@
 {
   "name": "@pineauto/piece-pineauto",
-  "version": "0.0.16",
+  "version": "0.2.1",
+  "description": "Activepieces community piece connecting TradingView alerts to Orderly Network with action-based routing, TP/SL, and position management",
   "type": "commonjs",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
+  "author": "hoddukzoa",
+  "license": "MIT",
+  "keywords": [
+    "activepieces",
+    "tradingview",
+    "orderly",
+    "orderly-network",
+    "pineauto",
+    "trading",
+    "automation",
+    "webhook",
+    "crypto",
+    "perpetual",
+    "tp-sl",
+    "algo-trading"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hoddukzoa12/activepieces.git",
+    "directory": "packages/pieces/community/pineauto"
+  },
+  "homepage": "https://pineauto.app",
+  "files": [
+    "src/**/*",
+    "README.md",
+    "README.ko.md",
+    "LICENSE"
+  ],
   "dependencies": {
     "tslib": "^2.3.0",
     "@noble/ed25519": "3.0.0",

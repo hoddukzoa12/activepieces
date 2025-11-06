@@ -15,6 +15,10 @@ import {
 import { OrderlyHttpClient, buildOrderlyUrl, createOrderlyClientFromAuth } from '../common/orderly-http';
 import { TradingViewOrderEvent } from '../common/tradingview.types';
 import { OrderlyEnvironment } from '../common/orderly-config';
+import { setLeverage, validateLeverage } from '../common/orderly-leverage.service';
+import { getPosition, calculateCloseQuantity } from '../common/orderly-position.service';
+import { createTPSL, OrderSide } from '../common/orderly-algo-order.service';
+import { getMarkPrice } from '../common/orderly-price.service';
 
 interface OrderResponsePayload {
   data?: Record<string, unknown>;
@@ -25,6 +29,12 @@ interface CreateOrderProps {
   reduce_only?: boolean;
   client_order_id?: string;
   order_event_override?: unknown;
+  position_aware?: boolean;
+  close_percentage?: number;
+  set_leverage?: number;
+  with_tpsl?: boolean;
+  tp_offset_percentage?: number;
+  sl_offset_percentage?: number;
 }
 
 export const createOrder = createAction({
@@ -43,6 +53,38 @@ export const createOrder = createAction({
       description: 'Optional identifier (<= 36 chars). Overrides value from the event.',
       required: false,
       defaultValue: '',
+    }),
+    position_aware: Property.Checkbox({
+      displayName: 'Position-Aware Sizing',
+      description: 'Automatically size order based on current open position',
+      required: false,
+      defaultValue: false,
+    }),
+    close_percentage: Property.Number({
+      displayName: 'Close Percentage',
+      description: 'If position-aware, percentage of position to close (0-100). Requires position_aware=true.',
+      required: false,
+    }),
+    set_leverage: Property.Number({
+      displayName: 'Set Leverage Before Order',
+      description: 'Leverage to set before placing order (1-50x). Leave empty to use current leverage.',
+      required: false,
+    }),
+    with_tpsl: Property.Checkbox({
+      displayName: 'Auto Create TP/SL',
+      description: 'Automatically create TP/SL orders after successful order placement',
+      required: false,
+      defaultValue: false,
+    }),
+    tp_offset_percentage: Property.Number({
+      displayName: 'TP Offset %',
+      description: 'Take profit offset percentage (e.g., 5 = 5% profit target). Requires with_tpsl=true.',
+      required: false,
+    }),
+    sl_offset_percentage: Property.Number({
+      displayName: 'SL Offset %',
+      description: 'Stop loss offset percentage (e.g., 2 = 2% stop loss). Requires with_tpsl=true.',
+      required: false,
     }),
     order_event_override: Property.Json({
       displayName: 'Order Event Override (optional)',
@@ -72,13 +114,22 @@ export const createOrder = createAction({
         ? ensureTradingViewOrderEvent(props.order_event_override)
         : null;
 
-    const event = overrideEvent ?? (await consumeQueuedTradingViewEvent(context));
+    // Consume from 'order' queue specifically for action-based routing
+    const event = overrideEvent ?? (await consumeQueuedTradingViewEvent(context, 'order'));
 
     if (!event) {
       throw new Error(
-        'No TradingView event found. Please trigger this action from the TradingView webhook or provide an override payload.',
+        '❌ No order event found in queue.\n\n' +
+          'Expected action field: "order", "enter_long", or "enter_short"\n' +
+          'Ensure TradingView webhook sends correct action field, or provide an override payload.',
       );
     }
+
+    logger.info?.('[pineauto] Processing order event', {
+      symbol: event.symbol,
+      side: event.side,
+      qty: event.qty,
+    });
     const quoteAsset = parseQuoteAsset(event.symbol);
 
     const sizing = await resolveOrderSizing({

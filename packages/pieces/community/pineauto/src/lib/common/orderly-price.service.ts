@@ -1,4 +1,126 @@
 import { OrderlyEnvironment, resolveOrderlyBaseUrl } from './orderly-config';
+import { OrderlyHttpClient, buildOrderlyUrl } from './orderly-http';
+
+/**
+ * Get mark price for a symbol using authenticated client
+ *
+ * @param params - Client, environment, and symbol
+ * @returns Mark price or null if unavailable
+ */
+export async function getMarkPrice(params: {
+  client: OrderlyHttpClient;
+  environment: OrderlyEnvironment;
+  symbol: string;
+}): Promise<number | null> {
+  const { client, environment, symbol } = params;
+  const baseUrl = resolveOrderlyBaseUrl(environment);
+
+  // Try futures endpoint first (mark price)
+  const futuresPrice = await tryFetchFuturesPriceWithClient(client, environment, symbol);
+  if (futuresPrice != null) {
+    return futuresPrice;
+  }
+
+  // Fallback to market info
+  const marketInfoPrice = await tryFetchMarketInfoPriceWithClient(client, environment, symbol);
+  if (marketInfoPrice != null) {
+    return marketInfoPrice;
+  }
+
+  // Last resort: recent trade
+  const tradePrice = await tryFetchRecentTradePriceWithClient(client, environment, symbol);
+  if (tradePrice != null) {
+    return tradePrice;
+  }
+
+  console.warn('[pineauto] ⚠️ Could not fetch mark price for', { symbol });
+  return null;
+}
+
+async function tryFetchFuturesPriceWithClient(
+  client: OrderlyHttpClient,
+  environment: OrderlyEnvironment,
+  symbol: string,
+): Promise<number | null> {
+  try {
+    const url = buildOrderlyUrl(environment, `/v1/public/futures/${encodeURIComponent(symbol)}`);
+    const response = await client.get(url);
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const body = (await response.json()) as Record<string, unknown>;
+    return extractPriceFromData(body['data']);
+  } catch (error) {
+    console.warn('[pineauto] Failed to fetch futures price', { symbol, error });
+    return null;
+  }
+}
+
+async function tryFetchMarketInfoPriceWithClient(
+  client: OrderlyHttpClient,
+  environment: OrderlyEnvironment,
+  symbol: string,
+): Promise<number | null> {
+  try {
+    const url = buildOrderlyUrl(environment, '/v1/public/market_info');
+    url.searchParams.set('symbol', symbol);
+    const response = await client.get(url);
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const body = (await response.json()) as Record<string, unknown>;
+    return extractPriceFromData(body['data']) ?? firstPositiveNumber(body['mark_price'], body['last_price']);
+  } catch (error) {
+    console.warn('[pineauto] Failed to fetch market info price', { symbol, error });
+    return null;
+  }
+}
+
+async function tryFetchRecentTradePriceWithClient(
+  client: OrderlyHttpClient,
+  environment: OrderlyEnvironment,
+  symbol: string,
+): Promise<number | null> {
+  try {
+    const url = buildOrderlyUrl(environment, '/v1/public/market_trades');
+    url.searchParams.set('symbol', symbol);
+    url.searchParams.set('limit', '1');
+    const response = await client.get(url);
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const body = (await response.json()) as Record<string, unknown>;
+    const data = body['data'];
+    const trades: Array<Record<string, unknown>> = [];
+
+    if (Array.isArray(data)) {
+      trades.push(...(data as Array<Record<string, unknown>>));
+    } else if (data && typeof data === 'object') {
+      const rows = (data as Record<string, unknown>)['rows'];
+      if (Array.isArray(rows)) {
+        trades.push(...(rows as Array<Record<string, unknown>>));
+      }
+    } else if (Array.isArray(body)) {
+      trades.push(...(body as Array<Record<string, unknown>>));
+    }
+
+    const firstTrade = trades[0];
+    if (!firstTrade) {
+      return null;
+    }
+
+    return firstPositiveNumber(firstTrade['price'], firstTrade['trade_price'], firstTrade['executed_price']);
+  } catch (error) {
+    console.warn('[pineauto] Failed to fetch recent trade price', { symbol, error });
+    return null;
+  }
+}
 
 export async function fetchReferencePrice(params: {
   environment: OrderlyEnvironment;

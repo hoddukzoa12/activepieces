@@ -139,6 +139,40 @@ export const tradingviewwebhook = createTrigger({
       return [];
     }
 
+    // Extract and validate action field for action-based routing
+    const actionRaw = body['action'] ? String(body['action']).toLowerCase() : 'order';
+
+    // Valid action types
+    const validActions = [
+      'order',
+      'close_position',
+      'set_leverage',
+      'create_algo',
+      // Extended action names for user-friendly aliases
+      'enter_long',
+      'exit_long',
+      'enter_short',
+      'exit_short',
+    ];
+
+    if (!validActions.includes(actionRaw)) {
+      console.error('[pineauto] Invalid action in payload', {
+        received: body['action'],
+        valid: validActions,
+      });
+      return [];
+    }
+
+    // Map legacy/friendly action names to standard action types
+    const actionMapping: Record<string, string> = {
+      enter_long: 'order',
+      enter_short: 'order',
+      exit_long: 'close_position',
+      exit_short: 'close_position',
+    };
+
+    const normalizedAction = actionMapping[actionRaw] ?? actionRaw;
+
     const event: TradingViewOrderEvent = {
       symbol: default_symbol,
       leverage: Math.max(1, Number(leverage) || 1),
@@ -146,11 +180,18 @@ export const tradingviewwebhook = createTrigger({
       qtyMode: qtyModeRaw as 'percent' | 'fixed',
       qty: numericQty,
       clientOrderId: typeof body.client_order_id === 'string' ? body.client_order_id : undefined,
+      action: normalizedAction as 'order' | 'close_position' | 'set_leverage' | 'create_algo',
       rawPayload: payload.body,
       emittedAt: Date.now(),
     };
 
     await enqueueTradingViewEvent(context, event);
+
+    console.info('[pineauto] Event queued', {
+      action: normalizedAction,
+      symbol: event.symbol,
+      side: event.side,
+    });
 
     return [event];
   },

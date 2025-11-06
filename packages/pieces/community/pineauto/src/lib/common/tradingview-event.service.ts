@@ -75,34 +75,100 @@ type StoreContext = {
   store: StoreLike;
 };
 
-const EVENT_QUEUE_KEY = 'pineauto:tradingview:event_queue';
+const LEGACY_EVENT_QUEUE_KEY = 'pineauto:tradingview:event_queue';
 
+/**
+ * Generate queue key based on action type for action-based routing
+ * @param action - Action type (order, close_position, set_leverage, create_algo)
+ * @returns Queue key string
+ */
+function getQueueKey(action: string): string {
+  return `pineauto:tradingview:${action}_queue`;
+}
+
+/**
+ * Enqueue TradingView event to action-specific queue
+ * Events are routed to different queues based on the action field
+ *
+ * @param context - Store context
+ * @param event - TradingView order event
+ */
 export async function enqueueTradingViewEvent(
   context: StoreContext,
   event: TradingViewOrderEvent,
 ): Promise<void> {
+  // Default to 'order' for backward compatibility
+  const action = event.action ?? 'order';
+  const queueKey = getQueueKey(action);
+
+  // Get existing queue with immutable slice
   const queue =
-    (await context.store.get<TradingViewOrderEvent[]>(EVENT_QUEUE_KEY, StoreScope.FLOW))?.slice() ?? [];
+    (await context.store.get<TradingViewOrderEvent[]>(queueKey, StoreScope.FLOW))?.slice() ?? [];
+
+  // FIFO: push to end
   queue.push(event);
-  await context.store.put(EVENT_QUEUE_KEY, queue, StoreScope.FLOW);
+
+  // Store updated queue
+  await context.store.put(queueKey, queue, StoreScope.FLOW);
+
+  // Optional logging (can be enabled for debugging)
+  // console.info(`[pineauto] Event queued to ${queueKey}`, { action, symbol: event.symbol });
 }
 
+/**
+ * Consume TradingView event from action-specific queue
+ * Supports fallback to legacy queue for backward compatibility
+ *
+ * @param context - Store context
+ * @param action - Action type to consume from (default: 'order')
+ * @returns TradingView event or null if queue is empty
+ */
 export async function consumeQueuedTradingViewEvent(
   context: StoreContext,
+  action: string = 'order',
 ): Promise<TradingViewOrderEvent | null> {
-  const queue =
-    (await context.store.get<TradingViewOrderEvent[]>(EVENT_QUEUE_KEY, StoreScope.FLOW))?.slice() ?? [];
+  const queueKey = getQueueKey(action);
 
+  // Try action-specific queue first
+  let queue =
+    (await context.store.get<TradingViewOrderEvent[]>(queueKey, StoreScope.FLOW))?.slice() ?? [];
+
+  // Fallback to legacy queue for backward compatibility
+  // Only for 'order' action to maintain compatibility with existing flows
+  if (queue.length === 0 && action === 'order') {
+    queue =
+      (await context.store.get<TradingViewOrderEvent[]>(LEGACY_EVENT_QUEUE_KEY, StoreScope.FLOW))?.slice() ?? [];
+
+    if (queue.length > 0) {
+      // Consuming from legacy queue - migrate to new structure
+      const event = queue.shift() ?? null;
+
+      if (queue.length === 0) {
+        await context.store.delete(LEGACY_EVENT_QUEUE_KEY, StoreScope.FLOW);
+      } else {
+        await context.store.put(LEGACY_EVENT_QUEUE_KEY, queue, StoreScope.FLOW);
+      }
+
+      // Optional logging for migration tracking
+      // console.warn('[pineauto] Consumed from legacy queue - consider migrating to action-based events');
+
+      return event;
+    }
+  }
+
+  // No events in queue
   if (queue.length === 0) {
     return null;
   }
 
+  // FIFO: shift from front
   const event = queue.shift() ?? null;
 
+  // Cleanup or update queue
   if (queue.length === 0) {
-    await context.store.delete(EVENT_QUEUE_KEY, StoreScope.FLOW);
+    await context.store.delete(queueKey, StoreScope.FLOW);
   } else {
-    await context.store.put(EVENT_QUEUE_KEY, queue, StoreScope.FLOW);
+    await context.store.put(queueKey, queue, StoreScope.FLOW);
   }
 
   return event;
